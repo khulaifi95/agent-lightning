@@ -1,5 +1,60 @@
 # Copyright (c) Microsoft. All rights reserved.
 
+"""
+Client-Server Implementation for LightningStore
+
+This module provides HTTP-based distributed access to a LightningStore instance, enabling
+multi-process and multi-machine agent training scenarios.
+
+Architecture Overview:
+---------------------
+The module implements a client-server pattern for the LightningStore:
+
+1. **LightningStoreServer**:
+   - Wraps any LightningStore implementation and exposes it via a FastAPI REST API
+   - Runs a uvicorn server in a background thread
+   - Handles process-aware delegation: in owner process, calls store directly;
+     in other processes, automatically switches to HTTP client
+   - Thread-safe with internal locking for concurrent access
+
+2. **LightningStoreClient**:
+   - HTTP client that communicates with a remote LightningStoreServer
+   - Implements retry logic with exponential backoff for transient failures
+   - Health checking and automatic server recovery detection
+   - Thread-safe session management with per-event-loop ClientSession caching
+
+Key Features:
+-------------
+- **Process-Aware**: Automatically detects if called from owner process or subprocess
+- **Pickle-Safe**: Both client and server can be safely pickled and sent to subprocesses
+- **Retry Logic**: Automatic retries on network failures with configurable backoff
+- **Health Checking**: Probes server health before retrying failed requests
+- **Error Handling**: Distinguishes application errors (4xx) from transient failures (5xx, network)
+- **Async-First**: Full async/await support with proper event loop handling
+
+UNSET Sentinel Pattern:
+-----------------------
+To distinguish "update field to None" from "don't update field", we use a sentinel value:
+- Python side: UNSET (instance of Unset class)
+- Pydantic/HTTP: PydanticUnset (serializable marker)
+This allows partial updates without ambiguity.
+
+Usage Example:
+--------------
+    # Server side
+    store = InMemoryLightningStore()
+    server = LightningStoreServer(store, "localhost", 8000)
+    await server.start()
+
+    # Client side (can be in a different process)
+    client = LightningStoreClient("http://localhost:8000")
+    rollout = await client.enqueue_rollout(input={"prompt": "Hello"})
+
+    # The server can also be used directly in the owner process
+    # and will automatically delegate to the underlying store
+    rollout = await server.enqueue_rollout(input={"prompt": "Hello"})
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -36,11 +91,30 @@ from .base import UNSET, LightningStore, Unset
 logger = logging.getLogger(__name__)
 
 
+# ================================================================================================
+# Pydantic Models for HTTP API Request/Response Serialization
+# ================================================================================================
+# These models define the contract between LightningStoreClient and LightningStoreServer.
+# They enable JSON serialization/deserialization of store operations over HTTP.
+
+
 class PydanticUnset(BaseModel):
+    """
+    Serializable marker for the UNSET sentinel value.
+
+    Used in update operations to distinguish between:
+    - "set field to None" (explicit None value)
+    - "don't update this field" (PydanticUnset)
+
+    This allows partial updates without ambiguity in HTTP requests.
+    """
+
     _type: Literal["UNSET"] = "UNSET"
 
 
 class RolloutRequest(BaseModel):
+    """Request model for starting or enqueueing a rollout."""
+
     input: TaskInput
     mode: Optional[Literal["train", "val", "test"]] = None
     resources_id: Optional[str] = None
@@ -49,24 +123,39 @@ class RolloutRequest(BaseModel):
 
 
 class QueryRolloutsRequest(BaseModel):
+    """Request model for querying rollouts with filters."""
+
     status: Optional[List[RolloutStatus]] = None
     rollout_ids: Optional[List[str]] = None
 
 
 class WaitForRolloutsRequest(BaseModel):
+    """Request model for waiting on multiple rollouts to complete."""
+
     rollout_ids: List[str]
     timeout: Optional[float] = None
 
 
 class RolloutId(BaseModel):
+    """Simple wrapper for rollout ID in requests."""
+
     rollout_id: str
 
 
 class AddResourcesRequest(BaseModel):
+    """Request model for adding new resources to the store."""
+
     resources: NamedResources
 
 
 class UpdateRolloutRequest(BaseModel):
+    """
+    Request model for partial rollout updates.
+
+    Uses PydanticUnset to distinguish "update to None" from "don't update".
+    All fields except rollout_id are optional and default to UNSET (no update).
+    """
+
     rollout_id: str
     input: Union[TaskInput, PydanticUnset] = Field(default_factory=PydanticUnset)
     mode: Union[Optional[Literal["train", "val", "test"]], PydanticUnset] = Field(default_factory=PydanticUnset)
@@ -77,6 +166,13 @@ class UpdateRolloutRequest(BaseModel):
 
 
 class UpdateAttemptRequest(BaseModel):
+    """
+    Request model for partial attempt updates.
+
+    Uses PydanticUnset to distinguish "update to None" from "don't update".
+    All fields except rollout_id and attempt_id are optional and default to UNSET.
+    """
+
     rollout_id: str
     attempt_id: Union[str, Literal["latest"]]
     status: Union[AttemptStatus, PydanticUnset] = Field(default_factory=PydanticUnset)
@@ -222,10 +318,29 @@ class LightningStoreServer(LightningStore):
             logger.info("Server stopped.")
 
     def _backend(self) -> LightningStore:
-        """Returns the object to delegate to in *this* process.
+        """
+        Returns the object to delegate to in *this* process.
 
-        - In the owner process: delegate to the in-process store.
-        - In a different process: delegate to a HTTP client talking to the server.
+        Process-Aware Delegation Strategy:
+        -----------------------------------
+        - **In the owner process** (pid == _owner_pid):
+          Delegates directly to self.store for zero-overhead access.
+
+        - **In a different process** (pid != _owner_pid):
+          Automatically creates and delegates to a LightningStoreClient that
+          communicates with the server via HTTP.
+
+        This enables transparent multi-process usage:
+        1. Parent process creates server and calls methods directly
+        2. Subprocess receives pickled server (without FastAPI app)
+        3. Subprocess calls same methods, which automatically use HTTP client
+
+        Thread-Safety:
+        --------------
+        The _client is created lazily per process. Since each process has its own
+        copy of the LightningStoreServer instance (via fork or pickle), there's no
+        race condition across processes. Within a process, the first call creates
+        the client and subsequent calls reuse it.
         """
         if os.getpid() == self._owner_pid:
             return self.store
@@ -234,18 +349,49 @@ class LightningStoreServer(LightningStore):
         return self._client
 
     def _setup_routes(self):
-        """Set up FastAPI routes for all store operations."""
+        """
+        Set up FastAPI routes for all LightningStore operations.
+
+        Creates a REST API with the following design principles:
+
+        1. **Error Handling Strategy**:
+           - Application errors (validation, business logic) → 400 Bad Request
+           - Network/server failures → 5xx status codes
+           - Clients use status code to decide whether to retry
+
+        2. **Endpoint Mapping**:
+           Each LightningStore method gets a corresponding HTTP endpoint:
+           - POST for operations that modify state or require request body
+           - GET for simple queries and retrievals
+
+        3. **Request/Response Serialization**:
+           - Request models (RolloutRequest, etc.) validate incoming JSON
+           - Response models automatically serialize return values
+           - UNSET sentinel is converted between PydanticUnset and UNSET
+
+        4. **Middleware**:
+           - Request timing logged for all endpoints
+           - Exception handler converts Python exceptions to 400 responses
+        """
         assert self.app is not None
 
         @self.app.exception_handler(Exception)
         async def _app_exception_handler(request: Request, exc: Exception):  # pyright: ignore[reportUnusedFunction]
             """
-            Convert unhandled application exceptions into 400 responses.
+            Convert unhandled application exceptions into 400 Bad Request responses.
 
-            - Client needs a reliable signal to distinguish "app bug / bad request"
-              from transport/session failures.
-            - 400 here means "do not retry"; network issues will surface as aiohttp
-              exceptions or 5xx and will be retried by the client shield.
+            Error Classification:
+            ---------------------
+            - **400 (this handler)**: Application errors (validation, business logic bugs)
+              → Client should NOT retry automatically
+            - **5xx**: Server/network failures (connection issues, timeouts)
+              → Client WILL retry with backoff
+
+            This distinction allows the client to implement smart retry logic:
+            - Retry on transient failures (network, server restart)
+            - Fail fast on application errors (bad request, invalid state)
+
+            The traceback is included to aid debugging during development.
             """
             logger.exception("Unhandled application error", exc_info=exc)
             return JSONResponse(
@@ -261,6 +407,17 @@ class LightningStoreServer(LightningStore):
         async def _log_time(  # pyright: ignore[reportUnusedFunction]
             request: Request, call_next: Callable[[Request], Awaitable[Response]]
         ):
+            """
+            Middleware to log request timing and client information.
+
+            Logs:
+            - Client address (host:port)
+            - HTTP method and path
+            - Response status code
+            - Request duration in milliseconds
+
+            This provides visibility into store performance and client behavior.
+            """
             start = time.perf_counter()
             response = await call_next(request)
             duration = (time.perf_counter() - start) * 1000
@@ -383,8 +540,42 @@ class LightningStoreServer(LightningStore):
                 metadata=request.metadata if not isinstance(request.metadata, PydanticUnset) else UNSET,
             )
 
-    # Delegate methods
+    # ============================================================================================
+    # Delegate Methods
+    # ============================================================================================
+    # All LightningStore interface methods delegate to _call_store_method, which in turn
+    # delegates to either the in-process store or the HTTP client depending on the current process.
+
     async def _call_store_method(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        """
+        Unified delegation method that handles both in-process and cross-process calls.
+
+        Delegation Logic:
+        -----------------
+        1. Determine backend (in-process store or HTTP client) via _backend()
+        2. Get the method by name from the backend
+        3. If backend is in-process store:
+           a. For wait_for_rollouts: call without lock (can block for long time)
+           b. For all other methods: call with lock held (thread-safety)
+        4. If backend is HTTP client: call without lock (client has its own locking)
+
+        Locking Strategy:
+        -----------------
+        The lock protects the in-process store from concurrent access within the owner process.
+        - **wait_for_rollouts**: Can block indefinitely waiting for rollouts to complete.
+          We don't hold the lock to avoid blocking other concurrent requests.
+        - **Other methods**: Quick operations that modify or query store state.
+          We hold the lock to ensure thread-safe access to the underlying store.
+        - **HTTP client**: Has its own session management and thread-safety, no lock needed.
+
+        Args:
+            method_name: Name of the LightningStore method to call
+            *args: Positional arguments to pass to the method
+            **kwargs: Keyword arguments to pass to the method
+
+        Returns:
+            The result of calling the store method
+        """
         backend = self._backend()
         method = getattr(backend, method_name)
         if backend is self.store:
@@ -535,15 +726,59 @@ class LightningStoreServer(LightningStore):
 
 
 class LightningStoreClient(LightningStore):
-    """HTTP client that talks to a remote LightningStoreServer.
+    """
+    HTTP client that talks to a remote LightningStoreServer with intelligent retry logic.
+
+    This client implements sophisticated failure handling to ensure reliable distributed
+    operation even in the presence of network issues and server restarts.
+
+    Key Features:
+    -------------
+    1. **Automatic Retry with Backoff**:
+       - Retries transient failures (network errors, 5xx status codes)
+       - Configurable exponential backoff schedule
+       - Distinguishes retriable vs non-retriable errors
+
+    2. **Health Checking**:
+       - Probes server /health endpoint before retrying failed requests
+       - Avoids wasted retries when server is known to be down
+       - Separate health probe backoff schedule
+
+    3. **Per-Event-Loop Session Management**:
+       - Maintains one aiohttp.ClientSession per event loop
+       - Handles multi-threaded scenarios (e.g., OpenTelemetry exporter on separate thread)
+       - Thread-safe session creation and lookup
+
+    4. **Smart Error Classification**:
+       - **4xx (except 408)**: Application errors → Fail immediately, no retry
+       - **5xx**: Server errors → Retry with health checking
+       - **Network errors**: Connection issues → Retry with health checking
+
+    5. **Special Handling for Polling Operations**:
+       - dequeue_rollout: No retry (returns None immediately on failure)
+       - wait_for_rollouts: Strict timeout limit to avoid blocking event loop
 
     Args:
-        server_address: The address of the LightningStoreServer to connect to.
-        retry_delays:
-            Backoff schedule (seconds) used when the initial request fails for a
-            non-application reason. Each entry is a retry attempt.
-        health_retry_delays:
-            Delays between /health probes while waiting for the server to come back.
+        server_address: The URL of the LightningStoreServer (e.g., "http://localhost:8000")
+        retry_delays: Backoff schedule in seconds for retrying failed requests.
+            Default: (1.0, 2.0, 5.0) means retry after 1s, 2s, then 5s before giving up.
+        health_retry_delays: Delays in seconds between /health probe attempts.
+            Default: (0.1, 0.2, 0.5) for fast health detection.
+
+    Thread-Safety:
+    --------------
+    This class is thread-safe. Multiple threads can share a single instance and
+    make concurrent requests. Each thread's event loop gets its own ClientSession.
+
+    Process-Safety:
+    ---------------
+    Safe to pickle and send to subprocesses. The __getstate__/__setstate__ methods
+    ensure sessions are not transferred across process boundaries.
+
+    Example:
+        client = LightningStoreClient("http://localhost:8000")
+        rollout = await client.enqueue_rollout(input={"prompt": "Hello"})
+        attempt = await client.dequeue_rollout()  # Returns None if queue empty
     """
 
     def __init__(
@@ -592,22 +827,42 @@ class LightningStoreClient(LightningStore):
         self._dequeue_first_unsuccessful = True
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        # In the proxy process, FastAPI middleware calls
-        # client_store.get_next_span_sequence_id(...). With
-        # reuse_session=True, _get_session() creates and caches a
-        # single ClientSession bound to the uvicorn event loop.
-        #
-        # Later, the OpenTelemetry exporter (LightningSpanExporter)
-        # runs its flush on its own private event loop (in a different
-        # thread) and calls client_store.add_otel_span(...) ->
-        # client_store.add_span(...).
-        #
-        # If we reuse one session across all, the exporter tries to reuse the
-        # same cached ClientSession that was created on the uvicorn
-        # loop. aiohttp.ClientSession is not loop-agnostic or
-        # thread-safe. Using it from another loop can hang on the
-        # first request. That's why we need a map from loop to session.
+        """
+        Get or create an aiohttp.ClientSession for the current event loop.
 
+        Problem: Multi-Threaded Event Loops
+        ------------------------------------
+        In the LLM proxy process, we have multiple event loops across different threads:
+
+        1. **Main Event Loop (uvicorn/FastAPI thread)**:
+           - Handles HTTP requests from runners
+           - Calls client_store.get_next_span_sequence_id(...)
+
+        2. **OpenTelemetry Exporter Loop (separate thread)**:
+           - Runs span export/flush on its own private event loop
+           - Calls client_store.add_otel_span(...) -> client_store.add_span(...)
+
+        aiohttp.ClientSession is NOT loop-agnostic or thread-safe:
+        - A session created on loop A cannot be used from loop B
+        - Attempting to do so can hang indefinitely or raise runtime errors
+
+        Solution: Per-Loop Session Cache
+        ---------------------------------
+        We maintain a mapping: event_loop_id -> ClientSession
+        - Each event loop gets its own ClientSession instance
+        - Sessions are created lazily on first use per loop
+        - Thread-safe via RLock (protects the dictionary)
+
+        Timeout Configuration:
+        ----------------------
+        - total: 30s - maximum time for entire request
+        - connect: 5s - maximum time to establish connection
+        - sock_connect: 5s - socket-level connection timeout
+        - sock_read: 30s - maximum time to read response
+
+        Returns:
+            aiohttp.ClientSession bound to the current event loop
+        """
         loop = asyncio.get_running_loop()
         key = id(loop)
         with self._lock:
@@ -649,15 +904,69 @@ class LightningStoreClient(LightningStore):
         json: Any | None = None,
     ) -> Any:
         """
-        Make an HTTP request with:
+        Make an HTTP request with intelligent retry logic and error classification.
 
-        1) First attempt.
-        2) On network/session failures: probe /health until back, then retry
-           according to self._retry_delays.
-        3) On 4xx (e.g., 400 set by server exception handler): do not retry.
+        Request Flow:
+        -------------
+        1. **Initial attempt**: Try the request immediately
+        2. **On failure**:
+           a. Classify the error (retriable vs non-retriable)
+           b. For retriable errors: probe server health
+           c. If healthy, sleep for backoff duration and retry
+        3. **Repeat** until success or retries exhausted
 
-        Returns parsed JSON (or raw JSON scalar like int).
-        Raises the last exception if all retries fail.
+        Error Classification:
+        ---------------------
+        1. **Non-Retriable (immediate failure)**:
+           - 4xx status codes (except 408 Request Timeout)
+           - These indicate application errors (bad request, invalid state)
+           - Server marked these as 400 via exception handler
+           - Retrying won't help; fail fast
+
+        2. **Retriable (with health check and backoff)**:
+           - 5xx status codes: Server errors (likely transient)
+           - 408 Request Timeout: Transient timeout
+           - Network errors:
+             * ServerDisconnectedError: Server closed connection
+             * ClientConnectorError: Cannot connect to server
+             * ClientOSError: OS-level network error
+             * TimeoutError: Request timed out
+
+        Health Checking Before Retry:
+        ------------------------------
+        Before retrying a failed request, we probe the /health endpoint.
+        This avoids wasting retry attempts when the server is known to be down.
+        If health check fails, we abort retries immediately.
+
+        Backoff Schedule:
+        -----------------
+        - Attempt 0: Immediate (no delay)
+        - Attempt 1: Wait retry_delays[0] seconds (default: 1.0s)
+        - Attempt 2: Wait retry_delays[1] seconds (default: 2.0s)
+        - Attempt 3: Wait retry_delays[2] seconds (default: 5.0s)
+        - If all retries exhausted, raise the last exception
+
+        Args:
+            method: HTTP method ("get" or "post")
+            path: URL path (e.g., "/enqueue_rollout")
+            json: Optional JSON payload for POST requests
+
+        Returns:
+            Parsed JSON response (dict, list, or scalar like int)
+
+        Raises:
+            aiohttp.ClientResponseError: For non-retriable 4xx errors
+            Exception: Last exception if all retries exhausted
+
+        Example:
+            # This will retry on network failures
+            result = await client._request_json("post", "/enqueue_rollout", json={...})
+
+            # This will fail immediately on application error (e.g., invalid input)
+            try:
+                result = await client._request_json("post", "/invalid_endpoint")
+            except aiohttp.ClientResponseError as e:
+                print(f"Application error: {e.status}")
         """
         session = await self._get_session()
         url = f"{self.server_address}{path if path.startswith('/') else '/'+path}"

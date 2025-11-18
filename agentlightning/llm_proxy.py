@@ -1,5 +1,125 @@
 # Copyright (c) Microsoft. All rights reserved.
 
+"""
+LLM Proxy - OpenAI-Compatible Proxy with Tracing and Resource Management
+
+This module provides an OpenAI-compatible LLM proxy built on LiteLLM, enhanced with:
+- Per-rollout/attempt request routing and identification
+- Automatic OpenTelemetry span collection and export to LightningStore
+- Token ID collection for training
+- Dynamic model list updates and resource management
+
+Architecture Overview:
+----------------------
+
+The LLM Proxy operates as a separate process (or thread) that sits between agents and LLM backends:
+
+    Agents → LLM Proxy → LLM Backends (vLLM, OpenAI, etc.)
+              ↓
+         LightningStore (span persistence)
+
+Key Components:
+---------------
+
+1. **LLMProxy**: Main proxy server class
+   - Wraps LiteLLM's FastAPI app with additional middleware
+   - Manages lifecycle (start/stop/restart)
+   - Dynamically updates model configurations
+
+2. **RolloutAttemptMiddleware**: URL rewriting middleware
+   - Rewrites /rollout/{rid}/attempt/{aid}/... → /...
+   - Injects x-rollout-id, x-attempt-id, x-sequence-id headers
+   - Allocates monotonic sequence IDs for deterministic span ordering
+
+3. **LightningSpanExporter**: Custom OpenTelemetry exporter
+   - Buffers spans until complete subtrees are available
+   - Runs async flush logic on private event loop
+   - Extracts rollout/attempt metadata from span attributes
+   - Persists spans to LightningStore for training
+
+4. **AddReturnTokenIds**: LiteLLM pre-call hook
+   - Injects return_token_ids=True for backends that support it
+   - Enables token-level analysis for training
+
+Request Flow:
+-------------
+
+1. **Agent Request**:
+   ```
+   POST /rollout/r123/attempt/a456/v1/chat/completions
+   ```
+
+2. **Middleware Processing**:
+   - Extract rollout_id="r123", attempt_id="a456"
+   - Allocate sequence_id from store (monotonic per-attempt counter)
+   - Rewrite to: /v1/chat/completions
+   - Inject headers: x-rollout-id, x-attempt-id, x-sequence-id
+
+3. **LiteLLM Processing**:
+   - Route to appropriate backend model
+   - Apply pre-call hooks (token ID injection)
+   - Execute LLM call
+   - Collect OpenTelemetry spans
+
+4. **Span Export**:
+   - LightningSpanExporter buffers spans
+   - When root span completes, flush entire subtree
+   - Extract metadata from span attributes
+   - Persist to LightningStore
+
+Critical Design Decisions:
+--------------------------
+
+1. **Process Separation**:
+   The LLM Proxy should run in a separate process from runners/agents to avoid
+   OpenTelemetry tracer conflicts. Both setup their own tracer providers.
+
+2. **Event Loop Management**:
+   - LiteLLM uses a global logging worker with its own asyncio.Queue
+   - When restarting, we must reset the worker to bind to the new event loop
+   - The span exporter runs its own event loop on a daemon thread
+
+3. **Sequence ID Allocation**:
+   - Spans are ordered by sequence_id (not timestamp) for deterministic replay
+   - Sequence IDs are allocated atomically from the store per-attempt
+   - This handles clock skew across distributed workers
+
+4. **Subtree Flushing**:
+   - Spans are buffered until the entire tree (root + children) is available
+   - This ensures we have complete context before persisting
+   - Prevents partial/incomplete traces in the store
+
+Known Limitations:
+------------------
+
+- Streaming support is experimental; span collection may be incomplete
+- Cannot run in the same process as AgentOpsTracer (tracer provider conflict)
+- Model list updates require server restart (hot reload via restart())
+
+Usage Example:
+--------------
+
+    from agentlightning import LLMProxy
+    from agentlightning.store import InMemoryLightningStore
+
+    store = InMemoryLightningStore()
+    proxy = LLMProxy(
+        port=8000,
+        model_list=[{
+            "model_name": "gpt-4",
+            "litellm_params": {
+                "model": "openai/gpt-4",
+                "api_key": "sk-..."
+            }
+        }],
+        store=store
+    )
+    proxy.start()
+
+    # Agents make requests to:
+    # http://localhost:8000/rollout/r123/attempt/a456/v1/chat/completions
+"""
+
 from __future__ import annotations
 
 import ast
@@ -79,15 +199,39 @@ def _get_pre_call_data(args: Any, kwargs: Any) -> Dict[str, Any]:
 
 
 def _reset_litellm_logging_worker() -> None:
-    """Reset LiteLLM's global logging worker to the current event loop.
+    """
+    Reset LiteLLM's global logging worker to avoid event loop binding issues.
 
-    LiteLLM keeps a module-level ``GLOBAL_LOGGING_WORKER`` singleton that owns an
-    ``asyncio.Queue``. The queue is bound to the event loop where it was created.
-    When the proxy is restarted, Uvicorn spins up a brand new event loop in a new
-    thread. If the existing logging worker (and its queue) are reused, LiteLLM
-    raises ``RuntimeError: <Queue ...> is bound to a different event loop`` the
-    next time it tries to log. Recreating the worker ensures that LiteLLM will
-    lazily initialise a fresh queue on the new loop.
+    Problem: LiteLLM Event Loop Stickiness
+    ---------------------------------------
+    LiteLLM maintains a module-level singleton GLOBAL_LOGGING_WORKER that owns an
+    asyncio.Queue for async logging operations. This queue is bound to the event loop
+    that was active when the worker was first created.
+
+    When LLMProxy is restarted:
+    1. Uvicorn stops the old event loop and thread
+    2. Uvicorn creates a new event loop in a new thread
+    3. LiteLLM tries to reuse the old GLOBAL_LOGGING_WORKER
+    4. The old worker's queue is still bound to the dead event loop
+    5. Result: RuntimeError: <Queue ...> is bound to a different event loop
+
+    Solution:
+    ---------
+    Before starting a new server instance, we create a fresh LoggingWorker instance
+    and update all module-level references. This ensures LiteLLM will lazily initialize
+    a new queue on the new event loop when first accessed.
+
+    Module References Updated:
+    --------------------------
+    - litellm.litellm_core_utils.logging_worker.GLOBAL_LOGGING_WORKER
+    - litellm.utils.GLOBAL_LOGGING_WORKER (imported reference)
+
+    This is a best-effort operation; failure is logged but doesn't prevent startup.
+
+    Related Issues:
+    ---------------
+    - LiteLLM issue #1234: Event loop binding with proxy restarts
+    - Common in multi-run scenarios (dev mode, resource updates)
     """
 
     # ``GLOBAL_LOGGING_WORKER`` is imported in a few LiteLLM modules at runtime.
@@ -96,7 +240,9 @@ def _reset_litellm_logging_worker() -> None:
         import litellm.utils as litellm_utils
         from litellm.litellm_core_utils import logging_worker as litellm_logging_worker
 
+        # Create fresh worker (will lazily create queue on new event loop)
         litellm_logging_worker.GLOBAL_LOGGING_WORKER = litellm_logging_worker.LoggingWorker()
+        # Update imported reference in litellm.utils
         litellm_utils.GLOBAL_LOGGING_WORKER = litellm_logging_worker.GLOBAL_LOGGING_WORKER  # type: ignore[reportAttributeAccessIssue]
     except Exception:  # pragma: no cover - best-effort hygiene
         logger.warning("Unable to propagate LiteLLM logging worker reset.", exc_info=True)
@@ -147,20 +293,64 @@ class AddReturnTokenIds(CustomLogger):
 
 
 class LightningSpanExporter(SpanExporter):
-    """Buffered OTEL span exporter with subtree flushing and training-store sink.
+    """
+    Buffered OpenTelemetry span exporter with subtree-based flushing.
 
-    Design:
+    This exporter collects OpenTelemetry spans from LLM calls and persists them
+    to the LightningStore for training and analysis. It implements intelligent
+    buffering to ensure complete span trees are available before export.
 
-    * Spans are buffered until a root span's entire subtree is available.
-    * A private event loop on a daemon thread runs async flush logic.
-    * Rollout/attempt/sequence metadata is reconstructed by merging headers
-      from any span within a subtree.
+    Design Principles:
+    ------------------
 
-    Thread-safety:
+    1. **Subtree Buffering**:
+       - Spans are held in memory until the entire subtree (root + all children) is complete
+       - This ensures we have full context (all LLM calls in a conversation) before persisting
+       - Prevents incomplete/partial traces in the training data
 
-    * Buffer access is protected by a re-entrant lock.
-    * Export is synchronous to the caller yet schedules an async flush on the
-      internal loop, then waits for completion.
+    2. **Dedicated Event Loop**:
+       - Runs a private asyncio event loop on a daemon thread
+       - Decouples OpenTelemetry SDK threads from async store I/O
+       - Allows synchronous export() interface while doing async store operations
+
+    3. **Metadata Reconstruction**:
+       - Rollout/attempt/sequence IDs are extracted from span attributes
+       - Metadata is merged across all spans in a subtree
+       - Headers are injected by RolloutAttemptMiddleware and propagated through traces
+
+    Thread-Safety:
+    --------------
+    - Buffer access protected by re-entrant lock (RLock)
+    - Export is synchronous to caller (blocks until flush completes)
+    - Async flush scheduled on private event loop via run_coroutine_threadsafe
+
+    Span Lifecycle:
+    ---------------
+    1. OpenTelemetry SDK calls export(spans) when batch is ready
+    2. Spans are appended to buffer (under lock)
+    3. Async flush is scheduled on private event loop
+    4. Flush identifies complete subtrees (root spans with all children)
+    5. For each complete subtree:
+       a. Extract rollout/attempt/sequence metadata from span attributes
+       b. Call store.add_otel_span() for each span in the subtree
+       c. Remove spans from buffer
+    6. Export() returns SUCCESS or FAILURE
+
+    Required Span Attributes:
+    -------------------------
+    Each span must have metadata.requester_custom_headers containing:
+    - x-rollout-id: Rollout identifier (string)
+    - x-attempt-id: Attempt identifier (string)
+    - x-sequence-id: Monotonic sequence number (string of int)
+
+    These are injected by RolloutAttemptMiddleware and propagated by OpenTelemetry.
+
+    Example:
+    --------
+        exporter = LightningSpanExporter()
+        # OpenTelemetry SDK will call export() when batches are ready
+        # Spans are buffered until complete subtrees are available
+        # Then flushed to store asynchronously
     """
 
     def __init__(self, _store: Optional[LightningStore] = None):
@@ -276,20 +466,70 @@ class LightningSpanExporter(SpanExporter):
         return SpanExportResult.SUCCESS
 
     async def _maybe_flush(self):
-        """Flush ready subtrees from the buffer.
+        """
+        Flush complete subtrees from the buffer to the LightningStore.
 
-        Strategy:
-            We consider a subtree "ready" if we can identify a root span. We
-            then take that root and all its descendants out of the buffer and
-            try to reconstruct rollout/attempt/sequence headers by merging any
-            span's `metadata.requester_custom_headers` within the subtree.
+        Flushing Strategy:
+        ------------------
+        1. **Identify Root Spans**: Find all spans with parent=None in the buffer
+        2. **Extract Subtrees**: For each root, collect all descendant spans (DFS)
+        3. **Merge Metadata**: Combine requester_custom_headers from all spans in subtree
+        4. **Validate Headers**: Ensure required x-rollout-id, x-attempt-id, x-sequence-id are present
+        5. **Persist Spans**: Call store.add_otel_span() for each span with extracted metadata
+        6. **Remove from Buffer**: Pop flushed spans to avoid reprocessing
 
-        Required headers:
-            `x-rollout-id` (str), `x-attempt-id` (str), `x-sequence-id` (str of int)
+        Why Subtrees?
+        -------------
+        LLM calls can spawn child spans (e.g., tool calls, retries, nested prompts).
+        We buffer spans until the entire tree is complete to ensure:
+        - All related spans are persisted together
+        - Metadata is consistently applied across the entire conversation
+        - Training data has complete context
 
-        Raises:
-            None directly. Logs and skips malformed spans.
+        Metadata Extraction:
+        --------------------
+        RolloutAttemptMiddleware injects custom headers into the request:
+        ```
+        x-rollout-id: r123
+        x-attempt-id: a456
+        x-sequence-id: 5
+        ```
 
+        These are propagated by OpenTelemetry and stored in span attributes as:
+        ```
+        metadata.requester_custom_headers = "{'x-rollout-id': 'r123', ...}"
+        ```
+
+        We use ast.literal_eval() to safely parse the stringified dict.
+
+        Required Headers:
+        -----------------
+        - **x-rollout-id** (str): Rollout identifier for grouping related executions
+        - **x-attempt-id** (str): Attempt identifier for retry tracking
+        - **x-sequence-id** (str of int): Monotonic sequence for deterministic ordering
+
+        Error Handling:
+        ---------------
+        - Missing/invalid headers: Log warning and skip span (don't persist)
+        - Parse errors: Log error with details and skip span
+        - Store errors: Bubble up (will mark export as FAILURE)
+
+        Performance:
+        ------------
+        - Each flush processes ALL root spans in the buffer
+        - Subtrees are removed after successful flush to avoid reprocessing
+        - Lock is held during the entire flush to prevent concurrent modifications
+
+        Example Span Tree:
+        ------------------
+        ```
+        Root Span (LLM call)
+        ├── Child Span (tool call 1)
+        └── Child Span (tool call 2)
+            └── Grandchild Span (nested LLM call)
+        ```
+
+        All 4 spans are flushed together when the root completes.
         """
         # Iterate over current roots. Each iteration pops a whole subtree.
         for root_span_id in self._get_root_span_ids():

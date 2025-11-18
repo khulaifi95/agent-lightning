@@ -1,10 +1,170 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Agent runner implementation for executing agent rollouts.
+"""
+Agent Runner - Execution Engine for LitAgent Rollouts
 
-This module provides the concrete implementation of the runner interface,
-handling the execution of agent rollouts with support for tracing, hooks,
-and distributed worker coordination.
+This module implements the core execution engine that runs agent rollouts,
+manages trace context, coordinates with the LightningStore, and invokes hooks.
+
+Architecture Overview:
+----------------------
+
+The LitAgentRunner is the bridge between the training loop and agent execution:
+
+    Trainer/Algorithm → Runner → Agent Execution
+                          ↓
+                    LightningStore (rollout coordination)
+                          ↓
+                      Tracer (span collection)
+
+Key Responsibilities:
+---------------------
+
+1. **Rollout Polling & Execution**:
+   - Poll LightningStore for pending rollouts
+   - Dequeue rollouts and allocate to this worker
+   - Execute agent with input from rollout
+   - Handle errors and retries
+
+2. **Trace Context Management**:
+   - Start/stop trace context for each rollout
+   - Collect spans from tracer after execution
+   - Persist spans to store with rollout/attempt metadata
+   - Extract final reward from spans
+
+3. **Resource Management**:
+   - Fetch latest resources (prompts, model configs) before execution
+   - Pass resources to agent for dynamic behavior
+   - Support hot-swapping of resources during training
+
+4. **Hook Invocation**:
+   - before_trace_start: Called before tracing begins
+   - after_trace_stop: Called after tracing ends with collected spans
+   - Enables custom logging, debugging, and instrumentation
+
+5. **Distributed Worker Coordination**:
+   - Support multiple workers dequeuing from same store
+   - Worker IDs for tracking and debugging
+   - Graceful shutdown and cleanup
+
+Execution Flow:
+---------------
+
+1. **Initialization** (once per runner):
+   ```python
+   runner = LitAgentRunner(tracer=AgentOpsTracer())
+   runner.init(agent=my_agent, hooks=[logging_hook])
+   ```
+
+2. **Worker Setup** (once per process):
+   ```python
+   runner.init_worker(worker_id=0, store=store)
+   ```
+
+3. **Rollout Iteration** (continuous):
+   ```python
+   async for event in runner.iter(agent):
+       # Runner handles:
+       # - Dequeue rollout from store
+       # - Fetch latest resources
+       # - Start trace context
+       # - Execute agent
+       # - Collect spans
+       # - Extract reward
+       # - Stop trace context
+       # - Invoke hooks
+       # - Mark rollout complete
+   ```
+
+4. **Worker Teardown** (on shutdown):
+   ```python
+   runner.teardown_worker(worker_id=0)
+   runner.teardown()
+   ```
+
+Rollout Lifecycle:
+------------------
+
+1. **Dequeue**: Poll store for pending rollout
+2. **Prepare**: Fetch resources, create trace context
+3. **Execute**: Run agent with input
+4. **Collect**: Extract spans and reward from tracer
+5. **Persist**: Store spans in LightningStore
+6. **Complete**: Mark rollout as completed
+
+Error Handling:
+---------------
+
+- **Agent Errors**: Logged and stored in rollout metadata
+- **Store Errors**: Retried with exponential backoff
+- **Tracer Errors**: Logged but don't fail rollout
+- **Hook Errors**: Logged but don't block execution
+
+Hook Integration:
+-----------------
+
+Hooks enable custom behavior around tracing:
+
+```python
+class MyHook(Hook):
+    async def before_trace_start(self, context):
+        # Called before agent execution
+        print(f"Starting rollout {context.rollout_id}")
+
+    async def after_trace_stop(self, context):
+        # Called after span collection
+        print(f"Collected {len(context.spans)} spans")
+```
+
+Distributed Execution:
+----------------------
+
+Multiple workers can run in parallel:
+
+```
+Worker 1 (runner + agent)  \\
+Worker 2 (runner + agent)  → LightningStore (shared queue)
+Worker 3 (runner + agent)  /
+```
+
+Each worker:
+- Polls store independently
+- Dequeues rollouts atomically
+- Executes in isolation
+- Persists results to shared store
+
+Thread Safety:
+--------------
+
+- Each worker runs in its own process/thread
+- Store operations are atomic (handled by LightningStore)
+- Tracer is local to each worker (no shared state)
+- Hooks are invoked serially within a worker
+
+Usage Example:
+--------------
+
+```python
+from agentlightning import LitAgentRunner, AgentOpsTracer
+from agentlightning.store import InMemoryLightningStore
+
+# Create components
+store = InMemoryLightningStore()
+tracer = AgentOpsTracer()
+runner = LitAgentRunner(tracer=tracer, max_rollouts=10)
+
+# Initialize
+runner.init(agent=my_agent)
+runner.init_worker(worker_id=0, store=store)
+
+# Execute rollouts
+async for event in runner.iter(my_agent):
+    print(f"Completed rollout: {event.rollout.id}")
+
+# Cleanup
+runner.teardown_worker(0)
+runner.teardown()
+```
 """
 
 from __future__ import annotations
